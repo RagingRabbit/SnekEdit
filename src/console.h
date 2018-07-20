@@ -7,6 +7,9 @@
 #include <conio.h>
 #include <chrono>
 
+#include <fcntl.h>
+#include <io.h>
+
 #ifndef _MSC_VER
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
 #define DISABLE_NEWLINE_AUTO_RETURN 0x0008
@@ -84,12 +87,15 @@ static CONSOLE_FONT_INFOEX defaultFont;
 static CONSOLE_SCREEN_BUFFER_INFO defaultScreen;
 static COORD defaultSize;
 
+static bool keys_last[0xFF];
+static bool keys_now[0xFF];
+
 static bool keys[0xFF];
 static float offtimers[0xFF];
 static float keytimers[0xFF];
 static long long last;
 
-static float keyrepeatrate = 0.06f;
+static float keyrepeatrate = 0.03f;
 static float keyrepeatdelay = 0.2f;
 
 extern "C" __declspec(dllexport)
@@ -297,9 +303,16 @@ inline void set_repeat_rate(float rate)
 }
 
 extern "C" __declspec(dllexport)
-inline void poll_events(void(p_key)(int, bool))
+inline bool get_key_state(int key)
+{
+	return keys_now[key];
+}
+
+extern "C" __declspec(dllexport)
+inline void poll_events(void(p_key)(int, bool), void(p_char)(char))
 {
 #ifdef _WIN32
+	// Character typed event
 	INPUT_RECORD records[32];
 	DWORD numevents = 0;
 	GetNumberOfConsoleInputEvents(GetStdHandle(STD_INPUT_HANDLE), &numevents);
@@ -311,26 +324,38 @@ inline void poll_events(void(p_key)(int, bool))
 		{
 			if (records[i].EventType == KEY_EVENT)
 			{
-				//p_key(records[i].Event.KeyEvent.wVirtualKeyCode, records[i].Event.KeyEvent.bKeyDown);
-
 				WORD code = records[i].Event.KeyEvent.wVirtualKeyCode;
 				BOOL down = records[i].Event.KeyEvent.bKeyDown;
+				DWORD mod = records[i].Event.KeyEvent.dwControlKeyState;
+				char ch = records[i].Event.KeyEvent.uChar.AsciiChar;
 
-				if (!keys[code] && down)
+				if (down && ch != 0)
 				{
-					keys[code] = true;
-					offtimers[code] = 0.0f;
-				}
-				else if (keys[code] && !down)
-				{
-					keys[code] = false;
-					offtimers[code] = -1.0f;
-					keytimers[code] = -1.0f;
-					p_key(code, false);
+					p_char(ch);
 				}
 			}
 		}
 	}
+
+	// Key input event
+	memcpy(keys_last, keys_now, 0xFF * sizeof(bool));
+	for (int i = 0; i < 0xFF; i++)
+	{
+		keys_now[i] = GetAsyncKeyState(i) & 0x8000;
+		if (keys_now[i] && !keys_last[i])
+		{
+			keys[i] = true;
+			offtimers[i] = 0.0f;
+		}
+		else if (!keys_now[i] && keys_last[i])
+		{
+			keys[i] = false;
+			offtimers[i] = -1.0f;
+			keytimers[i] = -1.0f;
+			p_key(i, false);
+		}
+	}
+#endif
 
 	long long now = get_nanos();
 	float delta = (now - last) / 1e9f;
@@ -357,6 +382,13 @@ inline void poll_events(void(p_key)(int, bool))
 		}
 		if (keytimers[i] >= 0.0f)
 		{
+			if (!(GetAsyncKeyState(i) & 0x8000))
+			{
+				keys[i] = false;
+				offtimers[i] = -1.0f;
+				keytimers[i] = -1.0f;
+				p_key(i, false);
+			}
 			keytimers[i] += delta;
 			if (keytimers[i] >= keyrepeatrate)
 			{
@@ -365,11 +397,10 @@ inline void poll_events(void(p_key)(int, bool))
 			}
 		}
 	}
-#endif
 }
 
 extern "C" __declspec(dllexport)
-inline void run_loop(const char *title, void(p_init)(void), void(p_update)(float), void(p_end)(void), void(p_key)(int, bool))
+inline void run_loop(const char *title, void(p_init)(void), void(p_update)(float), void(p_end)(void), void(p_key)(int, bool), void(p_char)(char))
 {
 	long long lastsec = get_nanos();
 	long long last = get_nanos();
@@ -391,7 +422,7 @@ inline void run_loop(const char *title, void(p_init)(void), void(p_update)(float
 			lastsec = now;
 		}
 
-		poll_events(p_key);
+		poll_events(p_key, p_char);
 
 		p_update(delta / 1e9f);
 		frames++;
